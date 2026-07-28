@@ -12,7 +12,7 @@ from drive.utils import (
 )
 from drive.utils.files import FileManager
 from drive.api.files import delete_entities
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 
 @frappe.whitelist()
@@ -119,3 +119,30 @@ def clear_deleted_files():
     for entity in result:
         doc = frappe.get_doc("File", entity, ignore_permissions=True)
         doc.delete()
+
+
+def clear_download_archives():
+    """Sweep stale folder-download zip artifacts. Cache entries pointing at them
+    expire on their own; this reclaims the bytes on disk and in S3."""
+    import os
+    import time
+
+    from drive.api.files import ARCHIVE_DIR, DOWNLOAD_TTL
+
+    cutoff = time.time() - DOWNLOAD_TTL
+    manager = FileManager()
+
+    local_dir = manager.site_folder / ARCHIVE_DIR
+    if local_dir.exists():
+        for path in local_dir.iterdir():
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+
+    if manager.s3_enabled:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=DOWNLOAD_TTL)
+        buckets = {manager.get_bucket(t) for t in manager.bucket_map} | {manager.bucket}
+        for bucket in filter(None, buckets):
+            objects = manager.conn.list_objects_v2(Bucket=bucket, Prefix=".drive-downloads/").get("Contents", [])
+            stale = [{"Key": o["Key"]} for o in objects if o["LastModified"] < cutoff_dt]
+            if stale:
+                manager.conn.delete_objects(Bucket=bucket, Delete={"Objects": stale})

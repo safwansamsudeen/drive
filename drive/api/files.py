@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import secrets
+import tempfile
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -26,7 +29,7 @@ from drive.utils import (
     STATUS_TRASHED,
 )
 from drive.utils.api import prettify_file
-from drive.utils.files import FileManager, get_s3_key, get_s3_url
+from drive.utils.files import FileManager, get_s3_key, get_s3_url, storage_key
 from drive.utils.users import mark_as_viewed
 
 from .permissions import get_teams, user_has_permission
@@ -294,6 +297,7 @@ def get_file_content(entity_name: str, trigger_download: bool = False, token: st
             "status",
             "file_url",
             "team",
+            "mime_type",
         ],
         as_dict=1,
     )
@@ -309,14 +313,53 @@ def get_file_content(entity_name: str, trigger_download: bool = False, token: st
     return get_file_internal(file, trigger_download)
 
 
+def _serve_resumable(manager, key, team, download_name, mime_type=None):
+    """Hand the client a Range/resume-capable download that streams from storage
+    instead of through this worker. A dropped connection (flaky link) resumes
+    from where it stopped rather than restarting, and no worker is tied up for
+    the length of the transfer.
+
+    - S3: redirect to a short-lived presigned URL; S3 serves the bytes.
+    - Disk + nginx: X-Accel-Redirect to an internal location; nginx serves them.
+    - Disk otherwise: send_file streams off disk with conditional Range support.
+    """
+    if manager.s3_enabled:
+        frappe.local.response["type"] = "redirect"
+        frappe.local.response["location"] = manager.presigned_url(team, key, download_name, mime_type)
+        return
+
+    xaccel_prefix = frappe.conf.get("drive_xaccel_prefix")
+    if xaccel_prefix:
+        response = Response(status=200)
+        response.headers["X-Accel-Redirect"] = f"{xaccel_prefix.rstrip('/')}/{key}"
+        response.headers["Content-Disposition"] = f'attachment; filename="{secure_filename(download_name)}"'
+        if mime_type:
+            response.headers["Content-Type"] = mime_type
+        return response
+
+    return send_file(
+        str(manager.site_folder / key),
+        mimetype=mime_type or "application/octet-stream",
+        as_attachment=True,
+        download_name=download_name,
+        conditional=True,
+        max_age=0,
+        environ=frappe.request.environ,
+    )
+
+
 def get_file_internal(file, trigger_download=0):
     if not trigger_download and file.file_type == "Video" and frappe.request.headers.get("Range"):
         return stream_file_content(file.name)
 
     manager = FileManager()
+    if trigger_download:
+        return _serve_resumable(
+            manager, storage_key(file.file_url), file.team, file.file_name, file.get("mime_type")
+        )
     return send_file(
         manager.get_file(file),
-        as_attachment=trigger_download,
+        as_attachment=False,
         conditional=True,
         max_age=3600,
         download_name=file.file_name,
@@ -378,27 +421,6 @@ def stream_file_content(entity_name: str):
     return res
 
 
-class _ZipSink:
-    """A non-seekable sink for `zipfile`. Because it exposes no `seek`/`tell`,
-    zipfile falls back to streaming-friendly data descriptors, letting us yield
-    archive bytes as they're produced instead of buffering the whole zip."""
-
-    def __init__(self):
-        self._chunks = bytearray()
-
-    def write(self, data):
-        self._chunks += data
-        return len(data)
-
-    def flush(self):
-        pass
-
-    def drain(self):
-        chunk = bytes(self._chunks)
-        del self._chunks[:]
-        return chunk
-
-
 def _iter_folder_files(entity_name, prefix=""):
     """Recursively yield (arcname, file) for downloadable files in a folder.
 
@@ -440,42 +462,88 @@ def _collect_download_files(entity_names):
             yield entity.file_name, entity
 
 
-def _stream_zip(files):
-    """Generator that yields a ZIP archive built one file at a time, so memory
-    stays flat regardless of the total size."""
-    manager = FileManager()
-    sink = _ZipSink()
-    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+DOWNLOAD_TTL = 60 * 60  # finished archives live for an hour
+ARCHIVE_DIR = "private/files/.drive-downloads"
+
+
+def _download_cache_key(token):
+    return f"drive-download:{token}"
+
+
+def _build_zip(manager, files, fileobj):
+    """Write a ZIP_STORED archive of `files` to a seekable file object. Files are
+    streamed block by block so a worker never holds a whole file in memory, and
+    because `fileobj` is seekable zipfile always writes a valid central directory."""
+    with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
         for arcname, child in files:
             info = zipfile.ZipInfo(arcname)
             info.compress_type = zipfile.ZIP_STORED
             with zf.open(info, "w") as dest:
-                source = manager.get_file(child)
-                try:
-                    while True:
-                        block = source.read(4 * 1024 * 1024)
-                        if not block:
-                            break
-                        dest.write(block)
-                        data = sink.drain()
-                        if data:
-                            yield data
-                finally:
-                    if hasattr(source, "close"):
-                        source.close()
-            data = sink.drain()
-            if data:
-                yield data
-    yield sink.drain()
+                for block in manager.iter_blocks(child):
+                    dest.write(block)
+
+
+def _write_archive(token, files):
+    """Build the zip artifact into storage and return (storage_key, team, size).
+
+    On disk the archive is written straight into the site's private files. On S3
+    it is built to a local temp file first, then uploaded, so peak disk use is
+    bounded by one archive and nothing is streamed to S3 half-formed."""
+    manager = FileManager()
+    key = f"{ARCHIVE_DIR}/{token}.zip"
+    team = files[0][1].team
+    if manager.s3_enabled:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with open(tmp_path, "wb") as fh:
+                _build_zip(manager, files, fh)
+            size = os.path.getsize(tmp_path)
+            s3_key = f".drive-downloads/{token}.zip"
+            manager.conn.upload_file(tmp_path, manager.get_bucket(team), s3_key)
+            return s3_key, team, size
+        finally:
+            os.remove(tmp_path)
+    else:
+        target = manager.site_folder / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as fh:
+            _build_zip(manager, files, fh)
+        return key, team, os.path.getsize(target)
+
+
+def build_download_archive(token, entities, zip_name, user):
+    """Background job: resolve the selection under the requesting user's
+    permissions, build the archive, and publish the result in the cache."""
+    cache = frappe.cache()
+    cache_key = _download_cache_key(token)
+    frappe.set_user(user)
+    try:
+        files = list(_collect_download_files(entities))
+        if not files:
+            raise frappe.NotFound("No downloadable files found")
+        key, team, size = _write_archive(token, files)
+        cache.set_value(
+            cache_key,
+            {"status": "ready", "owner": user, "key": key, "team": team, "file_name": zip_name, "size": size},
+            expires_in_sec=DOWNLOAD_TTL,
+        )
+    except Exception as e:
+        frappe.log_error("Drive: archive build failed", e)
+        cache.set_value(
+            cache_key,
+            {"status": "failed", "owner": user, "error": str(e)},
+            expires_in_sec=DOWNLOAD_TTL,
+        )
 
 
 @frappe.whitelist(allow_guest=True)
 def download_folder(entities: str):
-    """Stream a ZIP of one or more Drive entities (folders and/or files).
-
-    Replaces the old client-side JSZip flow, which loaded every file into
-    browser memory and hung on large folders. Here the server streams the
-    archive a file at a time via chunked transfer.
+    """Kick off a background build of a ZIP for one or more entities and return a
+    capability token. The client polls `download_status` and then fetches the
+    finished archive from `download_archive` — a Range/resume-capable, infra-served
+    download that never holds a worker open for the whole (potentially multi-GB)
+    transfer, so large folders no longer time out into a corrupt half-zip.
 
     :param entities: JSON list of File names (the user's selection)
     """
@@ -484,21 +552,55 @@ def download_folder(entities: str):
     if not entities:
         frappe.throw("Nothing to download", ValueError)
 
-    # Materialise the file list up front so a permission error surfaces as a
-    # clean HTTP error instead of a corrupt, half-streamed zip.
+    # Resolve once up front so a permission error surfaces immediately instead of
+    # failing inside the background job.
     files = list(_collect_download_files(entities))
     if not files:
         frappe.throw("No downloadable files found", frappe.NotFound)
 
     if len(entities) == 1:
-        title = frappe.get_value("File", entities[0], "file_name")
-        zip_name = f"{title}.zip"
+        zip_name = f"{frappe.get_value('File', entities[0], 'file_name')}.zip"
     else:
         zip_name = f"Drive Download {frappe.utils.now()}.zip"
 
-    response = Response(_stream_zip(files), mimetype="application/zip", direct_passthrough=True)
-    response.headers["Content-Disposition"] = f'attachment; filename="{secure_filename(zip_name)}"'
-    return response
+    token = secrets.token_urlsafe(24)
+    user = frappe.session.user
+    frappe.cache().set_value(
+        _download_cache_key(token), {"status": "building", "owner": user}, expires_in_sec=DOWNLOAD_TTL
+    )
+    frappe.enqueue(
+        build_download_archive,
+        queue="long",
+        timeout=3600,
+        token=token,
+        entities=entities,
+        zip_name=zip_name,
+        user=user,
+    )
+    return {"token": token, "file_name": zip_name}
+
+
+def _get_download_entry(token):
+    entry = frappe.cache().get_value(_download_cache_key(token))
+    if not entry or entry.get("owner") != frappe.session.user:
+        frappe.throw("Not found", frappe.DoesNotExistError)
+    return entry
+
+
+@frappe.whitelist(allow_guest=True)
+def download_status(token: str):
+    """Poll the state of an archive build: building | ready | failed."""
+    entry = _get_download_entry(token)
+    return {"status": entry["status"], "error": entry.get("error"), "size": entry.get("size")}
+
+
+@frappe.whitelist(allow_guest=True)
+def download_archive(token: str):
+    """Serve a finished archive as a Range/resume-capable download."""
+    entry = _get_download_entry(token)
+    if entry.get("status") != "ready":
+        frappe.throw("Not found", frappe.DoesNotExistError)
+    return _serve_resumable(FileManager(), entry["key"], entry.get("team"), entry["file_name"], "application/zip")
 
 
 @frappe.whitelist()

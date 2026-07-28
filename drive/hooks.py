@@ -148,6 +148,7 @@ fixtures = [
 
 scheduler_events = {
     "daily": ["drive.api.scripts.auto_delete_from_trash", "drive.api.scripts.clear_deleted_files"],
+    "hourly": ["drive.api.scripts.clear_download_archives"],
 }
 
 after_request = "drive.api.product.after_request"

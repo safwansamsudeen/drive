@@ -11,6 +11,7 @@ import mimemapper
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from PIL import Image, ImageOps
+from werkzeug.utils import secure_filename
 
 from drive.locks.distributed_lock import DistributedLock
 
@@ -203,6 +204,34 @@ class FileManager:
             frappe.throw("Could not find this file.", frappe.DoesNotExistError)
 
         return buf
+
+    def presigned_url(self, team, key, download_name, mime_type=None, expires=3600):
+        """A short-lived S3 GET URL that streams the object directly to the client
+        with Range/resume support, so no worker is held for the transfer."""
+        params = {
+            "Bucket": self.get_bucket(team),
+            "Key": key,
+            "ResponseContentDisposition": f'attachment; filename="{secure_filename(download_name)}"',
+        }
+        if mime_type:
+            params["ResponseContentType"] = mime_type
+        return self.conn.generate_presigned_url("get_object", Params=params, ExpiresIn=expires)
+
+    def iter_blocks(self, entity, block_size=4 * 1024 * 1024):
+        """Yield a file's bytes lazily, without ever holding the whole file in
+        memory. S3 objects come from the team-aware StreamingBody; disk files are
+        read straight off the filesystem."""
+        if self.s3_enabled:
+            source = self.get_file(entity)
+            try:
+                while chunk := source.read(block_size):
+                    yield chunk
+            finally:
+                source.close()
+        else:
+            with open(self.site_folder / storage_key(entity.file_url), "rb") as fh:
+                while chunk := fh.read(block_size):
+                    yield chunk
 
     def write_file(self, path: str | Path, content: str):
         if self.s3_enabled:
